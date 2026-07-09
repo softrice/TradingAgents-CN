@@ -14,8 +14,8 @@ def main():
     print("🚀 TradingAgents-CN Web应用启动器")
     print("=" * 50)
     
-    # 获取项目根目录
-    project_root = Path(__file__).parent
+    # 获取项目根目录（本脚本位于 scripts/startup/）
+    project_root = Path(__file__).resolve().parents[2]
     web_dir = project_root / "web"
     app_file = web_dir / "app.py"
     
