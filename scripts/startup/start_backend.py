@@ -15,8 +15,8 @@ def main():
     print("🚀 TradingAgents-CN Backend Launcher")
     print("=" * 50)
     
-    # 确保在项目根目录
-    project_root = Path(__file__).parent
+    # 确保在项目根目录（本脚本位于 scripts/startup/）
+    project_root = Path(__file__).resolve().parents[2]
     os.chdir(project_root)
     
     # 检查Python版本

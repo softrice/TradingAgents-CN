@@ -288,7 +288,7 @@ async def main():
     logger.info("🚀 认证系统迁移工具")
     logger.info("=" * 60)
     logger.info("此工具将把基于配置文件的认证迁移到基于数据库的认证")
-    logger.info()
+    logger.info("")
     
     try:
         # 1. 执行迁移
