@@ -45,10 +45,20 @@ def initialize(context):
     g.momentum_weight = 0.15
     g.min_select = 1
 
+    # 月中涨停打开卖出后的补位状态
+    g.score_df = None
+    g.candidate_rank = []
+    g.pending_replenish = False
+    g.recently_sold = set()
+    g.rebalance_date = None
+
     run_daily(prepare_stock_list, '09:00')
     run_monthly(get_stock_list, 1, '09:01')
     run_monthly(my_trade, 1, '09:30')
     run_daily(check_limit_up, '10:00')
+    # 涨停打开后不立刻追买：下午/次日再补，且跳过当日涨停
+    run_daily(replenish_positions, '09:35')
+    run_daily(replenish_positions, '14:50')
 
 
 def get_min_lot(stock_code):
@@ -79,6 +89,54 @@ def calc_affordable_amount(stock_code, budget, limit_price):
     if limit_price <= 0 or budget < limit_price * min_lot:
         return 0
     return min_lot * int(budget / limit_price / min_lot)
+
+
+def is_unbuyable(current_data, stock_code):
+    """当前无法买入：停牌、无报价、或涨停封板。"""
+    cd = current_data[stock_code]
+    if cd.paused:
+        return True
+    if cd.last_price <= 0:
+        return True
+    if cd.high_limit > 0 and cd.last_price >= cd.high_limit * 0.998:
+        return True
+    return False
+
+
+def get_current_slots_needed(context):
+    """距离目标持仓数还差几只。"""
+    hold_count = len(context.portfolio.positions)
+    return max(0, g.stock_num - hold_count)
+
+
+def pick_replenish_targets(context, hold_list, slots_needed):
+    """
+    从月初缓存的候选排名中顺延补位。
+    跳过：已持仓、当日刚卖出、涨停、停牌、买不起。
+    """
+    if slots_needed <= 0 or not g.candidate_rank:
+        return []
+
+    current_data = get_current_data()
+    per_stock_value = context.portfolio.total_value / g.stock_num
+    targets = []
+
+    for code in g.candidate_rank:
+        if len(targets) >= slots_needed:
+            break
+        if code in hold_list:
+            continue
+        if code in g.recently_sold:
+            continue
+        if is_unbuyable(current_data, code):
+            continue
+
+        price = current_data[code].last_price
+        if calc_affordable_amount(code, per_stock_value, price) <= 0:
+            continue
+        targets.append(code)
+
+    return targets
 
 
 def select_target_stocks(context, score_df, hold_list, stock_num):
@@ -276,6 +334,11 @@ def get_stock_list(context):
     select_count = max(g.min_select, min(g.stock_num, len(target_list)))
     target_list = target_list[:select_count]
 
+    # 缓存排名，供月中涨停打开后补位
+    g.score_df = score_df
+    g.candidate_rank = list(score_df.index)
+    g.rebalance_date = context.current_dt.date()
+
     print('========== 综合打分详情 ==========')
     print(score_df[['dividend_ratio', 'momentum', 'total_score']].head(10))
     print('==================================')
@@ -337,10 +400,18 @@ def my_trade(context):
         amount = int(g.buy_df.loc[s, 'amount'])
         if amount <= 0:
             print('跳过买入 %s：数量为 0' % s)
+            g.pending_replenish = True
+            continue
+        if is_unbuyable(current_data, s):
+            print('跳过买入 %s：开盘涨停/停牌，稍后补位' % s)
+            g.pending_replenish = True
             continue
         print('买入', [s, g.buy_df.loc[s, 'name']])
         order(s, amount, LimitOrderStyle(g.buy_df.loc[s, 'price']))
         print('———————————————————————————————————')
+
+    if get_current_slots_needed(context) > 0:
+        g.pending_replenish = True
 
 
 def check_limit_up(context):
@@ -350,11 +421,61 @@ def check_limit_up(context):
         for s in g.high_limit_list:
             if current_data[s].last_price < current_data[s].high_limit:
                 order_target_value(s, 0)
-                print(s, '涨停打开，卖出')
+                g.recently_sold.add(s)
+                g.pending_replenish = True
+                print(s, '涨停打开，卖出（待补位）')
                 print('———————————————————————————————————')
             else:
                 print(s, '涨停，继续持有')
                 print('———————————————————————————————————')
+
+
+def replenish_positions(context):
+    """
+    涨停打开卖出后的补位：不立刻在 10:00 追买，而是 09:35/14:50 尝试。
+    从月初候选排名顺延，跳过当日涨停/停牌/刚卖出/买不起的标的。
+    """
+    slots_needed = get_current_slots_needed(context)
+    if slots_needed <= 0:
+        g.pending_replenish = False
+        g.recently_sold = set()
+        return
+
+    # 月初调仓日上午 10:00 前不补位，避免和 my_trade 冲突
+    if g.rebalance_date == context.current_dt.date() and context.current_dt.hour < 10:
+        return
+
+    if not g.candidate_rank:
+        print('补位跳过：无缓存候选排名')
+        return
+
+    hold_list = list(context.portfolio.positions.keys())
+    buy_list = pick_replenish_targets(context, hold_list, slots_needed)
+    if not buy_list:
+        print('补位待定：暂无可买标的（可能均在涨停/停牌），稍后重试')
+        g.pending_replenish = True
+        return
+
+    per_stock_value = context.portfolio.total_value / g.stock_num
+    current_data = get_current_data()
+
+    print('========== 持仓补位 ==========')
+    print('需补 %d 只，尝试买入: %s' % (slots_needed, buy_list))
+
+    for code in buy_list:
+        if is_unbuyable(current_data, code):
+            print('跳过 %s：当前涨停或停牌' % code)
+            continue
+        order_target_value(code, per_stock_value)
+        print('补位买入 %s，目标市值 %.2f' % (code, per_stock_value))
+
+    remaining = get_current_slots_needed(context)
+    g.pending_replenish = remaining > 0
+    if remaining == 0:
+        g.recently_sold = set()
+    else:
+        print('补位后仍缺 %d 只，后续继续尝试' % remaining)
+    print('==============================')
 
 
 def filter_paused_stock(stock_list):
