@@ -118,10 +118,12 @@ WEAK_STOCK_SCALE = 0.40
 WEAK_USE_MA      = True
 MA_WINDOW        = 60
 
-ONE_WAY_COST_BPS = 10
-MAX_TURNOVER     = 0.30
-# ETF 模式: 价值↔成长切换日，对股票腿额外计一次双边换手成本
-ETF_ROTATION_SWITCH_COST = True
+# --- 交易成本 & 换手 ---
+# ONE_WAY_COST_BPS: 单边费率，单位 bp(基点)。1bp = 万分之一 = 0.01%
+#   万一手续费 → ONE_WAY_COST_BPS = 1
+#   万三       → 3 ;  万五 → 5 ;  万十(0.10%) → 10
+ONE_WAY_COST_BPS = 1     # 默认: 万一 (单边 0.01%)
+MAX_TURNOVER     = 0.30  # 单次调仓最大换手 (权重变化绝对值之和)
 
 DATA_START = '2013-07-18'
 DATA_END   = '2026-08-16'
