@@ -29,7 +29,7 @@ plt.rcParams['axes.unicode_minus'] = False
 # =============================================================================
 
 # --- 数据模式: index + etf(长历史可交易 ETF) ---
-DATA_MODES = ['index', 'etf']
+DATA_MODES = ['etf']              # 快速: 只跑 etf; 对比 index 时改为 ['index','etf']
 PRIMARY_DATA_MODE = 'etf'
 COMPARE_MODES = True
 
@@ -107,7 +107,7 @@ DATA_END   = '2026-08-16'
 IS_END     = '2018-12-31'
 OOS_START  = '2019-01-01'
 
-RUN_GRID = True                     # 仅对 PRIMARY_DATA_MODE 跑网格
+RUN_GRID = False                    # True=24组网格很慢, 像卡住; 先 False 确认能跑通
 GRID_LOOKBACK = [10, 20, 40]
 GRID_THRESH   = [0.0, 0.005, 0.01, 0.02]
 GRID_REBAL_DAYS = [5, 10]
@@ -133,9 +133,10 @@ def get_close(codes, start, end, fq='pre'):
 
 
 def probe_has_data(code, start, end, fq=None, min_bars=10):
+    """用最近若干条快速探测, 避免全区间拉取过慢。"""
     try:
         df = get_price(
-            code, start_date=start, end_date=end,
+            code, end_date=end, count=max(min_bars + 5, 30),
             fields='close', frequency='daily', panel=False, fq=fq
         )
         if df is None or len(df) == 0:
@@ -559,6 +560,8 @@ def compare_modes(mode_store, primary_scenario=PRIMARY_SCENARIO):
 # 3. 主流程
 # =============================================================================
 
+print('>>> 脚本开始运行...', flush=True)
+
 if isinstance(DATA_MODES, str):
     DATA_MODES = [DATA_MODES]
 
@@ -602,9 +605,13 @@ if RUN_GRID and PRIMARY_DATA_MODE in mode_store:
     grid_rows = []
     base_budget = BUDGET_SCENARIOS[ACTIVE_BUDGET]
     idx = ds['aligned_close'].dropna().pct_change().dropna().index
+    total = len(GRID_LOOKBACK) * len(GRID_THRESH) * len(GRID_REBAL_DAYS)
+    done = 0
     for lb in GRID_LOOKBACK:
         for th in GRID_THRESH:
             for rb in GRID_REBAL_DAYS:
+                done += 1
+                print(f'  网格进度 {done}/{total}  LOOKBACK={lb} THRESH={th} REBAL={rb}', flush=True)
                 try:
                     gres = run_backtest(
                         ds, base_budget, lookback=lb, thresh=th,
