@@ -15,6 +15,7 @@
   6. 单边交易成本 + 最大单次换手约束
   7. 样本内(2013-2018) / 样本外(2019+) 分段评估
   8. 修复: 周频末交易日调仓、消除 bfill 前视、打印真实样本区间
+  9. 价值/成长/基准改用全收益指数 (自动解析可用代码)
 """
 
 import warnings
@@ -32,16 +33,41 @@ plt.rcParams['axes.unicode_minus'] = False
 # 0. 全局配置
 # =============================================================================
 
-# --- 标的 (报错时按注释换备选) ---
-VALUE_CODE   = '399371.XSHE'    # 国证价值
-GROWTH_CODE  = '399370.XSHE'    # 国证成长
+# --- 全收益指数候选 (按优先级，启动时自动解析第一个有数据的) ---
+# 国证 R 指数: 480080/480081 = 成长/价值 100 全收益 (CNI 编制规则)
+VALUE_CODE_CANDIDATES = [
+    ('480081.XSHE', '国证价值100全收益'),
+    ('480081.CNI',  '国证价值100全收益(CNI后缀)'),
+    ('H980081.CSI', '国证价值100全收益(备选)'),
+    ('980081.XSHE', '国证价值100价格指数(降级)'),
+    ('399371.XSHE', '国证价值旧价格指数(降级)'),
+]
+GROWTH_CODE_CANDIDATES = [
+    ('480080.XSHE', '国证成长100全收益'),
+    ('480080.CNI',  '国证成长100全收益(CNI后缀)'),
+    ('H980080.CSI', '国证成长100全收益(备选)'),
+    ('980080.XSHE', '国证成长100价格指数(降级)'),
+    ('399370.XSHE', '国证成长旧价格指数(降级)'),
+]
+BENCH_CODE_CANDIDATES = [
+    ('H00905.CSI',  '中证500全收益'),
+    ('H00905.XSHG', '中证500全收益(备选)'),
+    ('000905.XSHG', '中证500价格指数(降级)'),
+]
+
+# 解析后的代码 (运行第 3 节时填充)
+VALUE_CODE = None
+GROWTH_CODE = None
+BENCH_CODE = None
+INDEX_DISPLAY = {}   # code -> 图例名称
+
+# --- 商品 / 债券仍用 ETF (无统一全收益指数; ETF 前复权≈持有人全收益) ---
 COMMODITY_CODES = [
     '159985.XSHE',              # 豆粕 ETF (~2019-12 上市)
     '518880.XSHG',              # 华安黄金 ETF
     '159981.XSHE',              # 能源化工 ETF (~2020-01 上市); 备选 159697/有色 ETF
 ]
-BOND_CODE    = '511260.XSHG'    # 十年国债 ETF
-BENCH_CODE   = '510500.XSHG'    # 中证 500 ETF (前复权≈全收益)
+BOND_CODE    = '511260.XSHG'    # 十年国债 ETF (前复权≈全收益)
 
 # --- 风险预算方案 (name -> {stock, commodity, bond}) ---
 BUDGET_SCENARIOS = {
@@ -88,15 +114,63 @@ SHOW_PLOTS = True
 # 1. 工具函数
 # =============================================================================
 
-def get_close(codes, start, end):
-    """拉取收盘价宽表。"""
+def get_close(codes, start, end, fq='pre'):
+    """拉取收盘价宽表。指数全收益用 fq=None，ETF 用 fq='pre'。"""
     if isinstance(codes, str):
         codes = [codes]
+    if not codes:
+        return pd.DataFrame()
     df = get_price(
         codes, start_date=start, end_date=end,
-        fields='close', frequency='daily', panel=False, fq='pre'
+        fields='close', frequency='daily', panel=False, fq=fq
     )
     return df.pivot(index='time', columns='code', values='close')
+
+
+def probe_has_data(code, start, end, fq=None, min_bars=10):
+    """探测代码在聚宽是否有足够数据。"""
+    try:
+        df = get_price(
+            code, start_date=start, end_date=end,
+            fields='close', frequency='daily', panel=False, fq=fq
+        )
+        if df is None or len(df) == 0:
+            return False
+        return df['close'].notna().sum() >= min_bars
+    except Exception:
+        return False
+
+
+def resolve_index_code(candidates, start, end, asset_label):
+    """从候选列表中解析第一个可用的全收益指数代码。"""
+    for code, desc in candidates:
+        if probe_has_data(code, start, end, fq=None):
+            print(f'  ✓ {asset_label}: {code}  ({desc})')
+            return code, desc
+        print(f'  ✗ {asset_label}: {code} 无数据，尝试下一个...')
+    raise ValueError(
+        f'无法解析 {asset_label} 全收益指数。'
+        f'请在研究环境运行 get_all_securities(types=["index"]) 查找后更新候选列表。'
+    )
+
+
+def fetch_mixed_close(index_codes, etf_codes, start, end):
+    """分别拉取指数(不复权)与 ETF(前复权)，合并为宽表。"""
+    frames = []
+    for code in index_codes:
+        df = get_close([code], start, end, fq=None)
+        if not df.empty:
+            frames.append(df)
+    if etf_codes:
+        df = get_close(etf_codes, start, end, fq='pre')
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    out = frames[0]
+    for f in frames[1:]:
+        out = out.join(f, how='outer')
+    return out.sort_index()
 
 
 def print_data_diagnostics(close_dict, label=''):
@@ -398,14 +472,28 @@ def run_backtest(
 # 3. 拉取数据
 # =============================================================================
 
-print('正在拉取数据...')
-all_codes = [VALUE_CODE, GROWTH_CODE, BOND_CODE, BENCH_CODE] + COMMODITY_CODES
-raw_close = get_close(all_codes, DATA_START, DATA_END)
+print('正在解析全收益指数代码...')
+VALUE_CODE, VALUE_NAME = resolve_index_code(VALUE_CODE_CANDIDATES, DATA_START, DATA_END, '价值')
+GROWTH_CODE, GROWTH_NAME = resolve_index_code(GROWTH_CODE_CANDIDATES, DATA_START, DATA_END, '成长')
+BENCH_CODE, BENCH_NAME = resolve_index_code(BENCH_CODE_CANDIDATES, DATA_START, DATA_END, '基准')
+INDEX_DISPLAY = {
+    VALUE_CODE: VALUE_NAME,
+    GROWTH_CODE: GROWTH_NAME,
+    BENCH_CODE: BENCH_NAME,
+}
+
+print('\n正在拉取数据...')
+index_codes = [VALUE_CODE, GROWTH_CODE]
+etf_codes = [BOND_CODE] + COMMODITY_CODES
+raw_close = fetch_mixed_close(index_codes, etf_codes, DATA_START, DATA_END)
+bench_raw = get_close([BENCH_CODE], DATA_START, DATA_END, fq=None)
 
 diag_parts = {}
-for code in all_codes:
-    name = code
-    diag_parts[name] = raw_close[code]
+for code in index_codes + etf_codes:
+    if code in raw_close.columns:
+        diag_parts[f'{code} ({INDEX_DISPLAY.get(code, "ETF")})'] = raw_close[code]
+if BENCH_CODE in bench_raw.columns:
+    diag_parts[f'{BENCH_CODE} ({BENCH_NAME})'] = bench_raw[BENCH_CODE]
 print_data_diagnostics(diag_parts, '(原始各标的)')
 
 # 商品篮子: 只用已有数据的标的
@@ -419,7 +507,7 @@ required = [VALUE_CODE, GROWTH_CODE, BOND_CODE] + available_commodities
 aligned_close = raw_close[required].dropna()
 print(f'\n组合对齐后样本: {aligned_close.index[0].date()} ~ {aligned_close.index[-1].date()} ({len(aligned_close)} 天)')
 
-bench_close = get_close([BENCH_CODE], DATA_START, DATA_END).iloc[:, 0]
+bench_close = bench_raw[BENCH_CODE]
 bench_close = bench_close.reindex(aligned_close.index).ffill()
 bench_nav = bench_close / bench_close.iloc[0]
 bench_ret = bench_close.pct_change().dropna()
@@ -513,7 +601,7 @@ bench_nav_aligned = bench_nav.reindex(primary['nav'].index).ffill()
 bench_ann = bench_nav_aligned.iloc[-1] ** (1 / years) - 1
 bench_mdd = (bench_nav_aligned / bench_nav_aligned.cummax() - 1).min()
 bench_sharpe = calc_metrics(bench_ret.reindex(primary['port_ret'].index).fillna(0))['sharpe']
-print(f"\n基准中证500: 年化 {bench_ann*100:.2f}%  回撤 {bench_mdd*100:.2f}%  夏普 {bench_sharpe:.3f}")
+print(f"\n基准({BENCH_NAME}): 年化 {bench_ann*100:.2f}%  回撤 {bench_mdd*100:.2f}%  夏普 {bench_sharpe:.3f}")
 
 
 # =============================================================================
@@ -585,16 +673,16 @@ if SHOW_PLOTS:
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 10))
 
-    axes[0].plot(nav_assets[VALUE_CODE], label='国证价值', linewidth=1.2)
-    axes[0].plot(nav_assets[GROWTH_CODE], label='国证成长', linewidth=1.2)
+    axes[0].plot(nav_assets[VALUE_CODE], label=INDEX_DISPLAY.get(VALUE_CODE, '价值'), linewidth=1.2)
+    axes[0].plot(nav_assets[GROWTH_CODE], label=INDEX_DISPLAY.get(GROWTH_CODE, '成长'), linewidth=1.2)
     for c in available_commodities:
-        axes[0].plot(nav_assets[c], label=c, linewidth=1.0, alpha=0.8)
-    axes[0].plot(nav_assets[BOND_CODE], label='十年国债', linewidth=1.2)
-    axes[0].set_title('各标的净值 (归一化)')
+        axes[0].plot(nav_assets[c], label=f'{c}(ETF)', linewidth=1.0, alpha=0.8)
+    axes[0].plot(nav_assets[BOND_CODE], label='十年国债ETF', linewidth=1.2)
+    axes[0].set_title('各标的净值 (归一化; 股=全收益指数, 商品/债=ETF前复权)')
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(bench_nav.reindex(nav.index), label='中证500ETF', alpha=0.7, linewidth=1.2, color='orange')
+    axes[1].plot(bench_nav.reindex(nav.index), label=INDEX_DISPLAY.get(BENCH_CODE, '中证500全收益'), alpha=0.7, linewidth=1.2, color='orange')
     for k, res in results.items():
         if 'RC' in k and '75:24:1' in k:
             axes[1].plot(res['nav'], label=k, alpha=0.6, linewidth=1.2, linestyle='--')
