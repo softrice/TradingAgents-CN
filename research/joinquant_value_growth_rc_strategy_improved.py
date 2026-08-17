@@ -6,9 +6,11 @@
 在聚宽研究环境 (notebook) 中整段粘贴运行。
 依赖: jqdata, pandas, numpy, matplotlib
 
-数据模式 (可同时跑 index + etf 对比):
-  - index: 价值/成长/基准用指数 (fq=None, 优先全收益代码)
-  - etf:   价值/成长/基准用可交易 ETF (fq='pre', 更接近实盘)
+数据模式 (可同时跑多种对比):
+  - index:      价值/成长/基准用指数 (fq=None)
+  - etf_v100:   国证价值100/成长100 ETF (159263/159259, 跟踪980081/980080)
+  - etf_proxy:  长历史风格代理 (510880/159915, 仅作补充对照)
+  - etf:        同 etf_v100 的别名
   商品/债券始终为 ETF 前复权。
 """
 
@@ -27,25 +29,27 @@ plt.rcParams['axes.unicode_minus'] = False
 # 0. 全局配置
 # =============================================================================
 
-# --- 数据模式: 'index' | 'etf' | ['index','etf'] ---
-DATA_MODES = ['index', 'etf']       # 同时跑两种; 只跑一种则改为 ['index'] 或 ['etf']
-PRIMARY_DATA_MODE = 'etf'           # 网格 / 详图用哪种模式
-COMPARE_MODES = True                # 打印指数 vs ETF 对比表
+# --- 数据模式 ---
+# index=指数; etf_v100=国证价值100/成长100 ETF; etf_proxy=长历史风格代理(对照)
+DATA_MODES = ['index', 'etf_v100', 'etf_proxy']
+PRIMARY_DATA_MODE = 'etf_v100'      # 网格 / 详图默认: 真·跟踪 ETF
+COMPARE_MODES = True
 
-# --- 指数模式候选 (fq=None) ---
+# --- 指数模式 (fq=None) ---
+# 注: 399371/399370 = 国证1000价值/成长(旧); 980081/980080 = 国证价值100/成长100(新)
 VALUE_INDEX_CANDIDATES = [
     ('480081.XSHE', '国证价值100全收益'),
     ('480081.CNI',  '国证价值100全收益(CNI)'),
     ('H980081.CSI', '国证价值100全收益(备选)'),
     ('980081.XSHE', '国证价值100价格指数'),
-    ('399371.XSHE', '国证价值旧价格指数'),
+    ('399371.XSHE', '国证1000价值(旧,非价值100)'),
 ]
 GROWTH_INDEX_CANDIDATES = [
     ('480080.XSHE', '国证成长100全收益'),
     ('480080.CNI',  '国证成长100全收益(CNI)'),
     ('H980080.CSI', '国证成长100全收益(备选)'),
     ('980080.XSHE', '国证成长100价格指数'),
-    ('399370.XSHE', '国证成长旧价格指数'),
+    ('399370.XSHE', '国证1000成长(旧,非成长100)'),
 ]
 BENCH_INDEX_CANDIDATES = [
     ('H00905.CSI',  '中证500全收益'),
@@ -53,20 +57,42 @@ BENCH_INDEX_CANDIDATES = [
     ('000905.XSHG', '中证500价格指数'),
 ]
 
-# --- ETF 模式候选 (fq='pre', 历史较长的风格代理) ---
-VALUE_ETF_CANDIDATES = [
-    ('510880.XSHG', '红利ETF(价值代理)'),
+# --- 国证价值100 / 成长100 官方 ETF (易方达, 2025 上市) ---
+VALUE_V100_ETF_CANDIDATES = [
+    ('159263.XSHE', '国证价值100ETF(159263→980081)'),
+]
+GROWTH_V100_ETF_CANDIDATES = [
+    ('159259.XSHE', '国证成长100ETF(159259→980080)'),
+]
+
+# --- 长历史风格代理 (与价值100/成长100 成分不同, 仅对照) ---
+VALUE_ETF_PROXY_CANDIDATES = [
+    ('510880.XSHG', '红利ETF(价值代理,非价值100)'),
     ('512040.XSHG', '价值ETF'),
     ('159913.XSHE', '价值ETF(深)'),
 ]
-GROWTH_ETF_CANDIDATES = [
-    ('159915.XSHE', '创业板ETF(成长代理)'),
+GROWTH_ETF_PROXY_CANDIDATES = [
+    ('159915.XSHE', '创业板ETF(成长代理,非成长100)'),
     ('159949.XSHE', '创业板50ETF'),
     ('159967.XSHE', '成长ETF'),
 ]
 BENCH_ETF_CANDIDATES = [
     ('510500.XSHG', '中证500ETF前复权'),
 ]
+
+ETF_MODE_SPECS = {
+    'etf_v100': {
+        'value': VALUE_V100_ETF_CANDIDATES,
+        'growth': GROWTH_V100_ETF_CANDIDATES,
+        'stock_type': '国证价值100/成长100 ETF(前复权)',
+    },
+    'etf_proxy': {
+        'value': VALUE_ETF_PROXY_CANDIDATES,
+        'growth': GROWTH_ETF_PROXY_CANDIDATES,
+        'stock_type': '风格代理ETF(前复权,非价值100/成长100)',
+    },
+}
+MIN_ALIGNED_DAYS_WARN = 504    # 对齐样本少于 2 年时提示
 
 COMMODITY_CODES = [
     '159985.XSHE',              # 豆粕 ETF
@@ -311,8 +337,14 @@ def effective_budget(base_budget, weak_today):
 # 2. 数据集准备 & 回测引擎
 # =============================================================================
 
+def normalize_mode(mode):
+    """'etf' 视为 etf_v100 别名。"""
+    return 'etf_v100' if mode == 'etf' else mode
+
+
 def prepare_dataset(mode, start=DATA_START, end=DATA_END):
     """解析代码、拉数据、对齐样本。返回 dataset dict。"""
+    mode = normalize_mode(mode)
     print(f"\n{'#'*60}")
     print(f'# 数据模式: {mode.upper()}')
     print(f"{'#'*60}")
@@ -326,17 +358,18 @@ def prepare_dataset(mode, start=DATA_START, end=DATA_END):
         bench_code, bench_name = resolve_code(BENCH_INDEX_CANDIDATES, start, end, '基准', fq=None)
         rotation_switch_cost = False
         stock_type = '指数(价格/全收益, fq=None)'
-    elif mode == 'etf':
+    elif mode in ETF_MODE_SPECS:
+        spec = ETF_MODE_SPECS[mode]
         stock_fq = 'pre'
         bench_fq = 'pre'
-        print('正在解析 ETF 代码 (前复权)...')
-        value_code, value_name = resolve_code(VALUE_ETF_CANDIDATES, start, end, '价值', fq='pre')
-        growth_code, growth_name = resolve_code(GROWTH_ETF_CANDIDATES, start, end, '成长', fq='pre')
+        print(f'正在解析 ETF 代码 (前复权) — {spec["stock_type"]}...')
+        value_code, value_name = resolve_code(spec['value'], start, end, '价值', fq='pre')
+        growth_code, growth_name = resolve_code(spec['growth'], start, end, '成长', fq='pre')
         bench_code, bench_name = resolve_code(BENCH_ETF_CANDIDATES, start, end, '基准', fq='pre')
         rotation_switch_cost = ETF_ROTATION_SWITCH_COST
-        stock_type = 'ETF(前复权≈全收益)'
+        stock_type = spec['stock_type']
     else:
-        raise ValueError(f'未知模式: {mode}')
+        raise ValueError(f'未知模式: {mode}，可用 index / etf_v100 / etf_proxy')
 
     display = {
         value_code: value_name,
@@ -366,8 +399,12 @@ def prepare_dataset(mode, start=DATA_START, end=DATA_END):
 
     required = [value_code, growth_code, BOND_CODE] + available_commodities
     aligned_close = raw_close[required].dropna()
-    print(f'[{mode}] 组合对齐: {aligned_close.index[0].date()} ~ {aligned_close.index[-1].date()} ({len(aligned_close)} 天)')
+    n_aligned = len(aligned_close)
+    print(f'[{mode}] 组合对齐: {aligned_close.index[0].date()} ~ {aligned_close.index[-1].date()} ({n_aligned} 天)')
     print(f'[{mode}] 股票腿={stock_type}; 轮动切换成本={"开" if rotation_switch_cost else "关"}')
+    if mode == 'etf_v100' and n_aligned < MIN_ALIGNED_DAYS_WARN:
+        print(f'  ⚠ 国证价值100/成长100 ETF 上市晚(159263≈2025-06, 159259≈2025-08)，'
+              f'对齐样本仅 {n_aligned} 天；长周期请对照 etf_proxy / index 模式')
 
     bench_close = bench_raw[bench_code].reindex(aligned_close.index).ffill()
     bench_nav = bench_close / bench_close.iloc[0]
@@ -569,7 +606,7 @@ def compare_modes(mode_store, primary_scenario=PRIMARY_SCENARIO):
     if len(mode_store) < 2:
         return
     print(f"\n{'='*60}")
-    print('指数 vs ETF 模式对比 (主方案 RC)')
+    print('多模式对比 (主方案 RC)')
     print(f"{'='*60}")
     rows = []
     for mode, pack in mode_store.items():
@@ -600,7 +637,11 @@ if isinstance(DATA_MODES, str):
 
 mode_store = {}
 
-for mode in DATA_MODES:
+for raw_mode in DATA_MODES:
+    mode = normalize_mode(raw_mode)
+    if mode in mode_store:
+        print(f'\n[{mode}] 已在 mode_store 中，跳过重复运行')
+        continue
     ds = prepare_dataset(mode)
     print(f"\n[{mode}] 开始回测...")
     results = run_all_scenarios(ds)
@@ -683,12 +724,15 @@ if SHOW_PLOTS and PRIMARY_DATA_MODE in mode_store:
     axes[0].grid(True, alpha=0.3)
 
     axes[1].plot(ds['bench_nav'].reindex(nav.index), label=ds['bench_name'], color='orange', alpha=0.7)
-    if 'index' in mode_store and PRIMARY_DATA_MODE != 'index':
-        idx_pk = mode_store['index']['primary_key']
-        axes[1].plot(mode_store['index']['results'][idx_pk]['nav'], label='指数模式', linestyle='--', alpha=0.6)
-    if 'etf' in mode_store and PRIMARY_DATA_MODE != 'etf':
-        etf_pk = mode_store['etf']['primary_key']
-        axes[1].plot(mode_store['etf']['results'][etf_pk]['nav'], label='ETF模式', linestyle='--', alpha=0.6)
+    overlay_colors = {'index': 'gray', 'etf_v100': 'green', 'etf_proxy': 'blue'}
+    for om, pack in mode_store.items():
+        if om == PRIMARY_DATA_MODE:
+            continue
+        opk = pack['primary_key']
+        axes[1].plot(
+            pack['results'][opk]['nav'], label=f'{om}',
+            linestyle='--', alpha=0.55, color=overlay_colors.get(om, None),
+        )
     axes[1].plot(nav, label=f'主策略 {pk}', linewidth=2.5, color='red')
     axes[1].set_title('组合 vs 基准 (虚线=另一数据模式)')
     axes[1].legend(fontsize=8)
@@ -711,4 +755,4 @@ if SHOW_PLOTS and PRIMARY_DATA_MODE in mode_store:
     print(f'\n[{PRIMARY_DATA_MODE}] 收益贡献: stock {cc["stock"]/cc.sum()*100:.1f}%  '
           f'commodity {cc["commodity"]/cc.sum()*100:.1f}%  bond {cc["bond"]/cc.sum()*100:.1f}%')
 
-print('\n完成。配置: DATA_MODES / PRIMARY_DATA_MODE / RUN_GRID / SHOW_PLOTS')
+print('\n完成。模式: index / etf_v100(159263+159259) / etf_proxy(510880+159915); RUN_GRID / SHOW_PLOTS 可调')
