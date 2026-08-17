@@ -291,9 +291,9 @@ def effective_budget(base_budget, weak_today):
 
 def prepare_dataset(mode, start=DATA_START, end=DATA_END):
     """解析代码、拉数据、对齐样本。返回 dataset dict。"""
-    print(f"\n{'#'*60}")
-    print(f'# 数据模式: {mode.upper()}')
-    print(f"{'#'*60}")
+    print(f"\n{'#'*60}", flush=True)
+    print(f'# 数据模式: {mode.upper()}', flush=True)
+    print(f"{'#'*60}", flush=True)
 
     if mode == 'index':
         stock_fq = None
@@ -484,8 +484,9 @@ def run_backtest(
 
 def run_all_scenarios(dataset):
     results = {}
-    for scen_name, budget in BUDGET_SCENARIOS.items():
-        print(f"  [{dataset['mode']}] 运行: {scen_name} ...")
+    specs = list(BUDGET_SCENARIOS.items())
+    for i, (scen_name, budget) in enumerate(specs, 1):
+        print(f"  [{dataset['mode']}] 回测 {i}/{len(specs)}: {scen_name} ...", flush=True)
         try:
             results[scen_name] = run_backtest(dataset, budget, label=scen_name)
         except Exception as e:
