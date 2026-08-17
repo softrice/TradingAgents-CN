@@ -201,10 +201,10 @@ def calc_metrics(port_ret, rf=0.025):
     return dict(ann=ann, mdd=mdd, sharpe=sharpe, calmar=calmar, days=len(port_ret), nav=nav)
 
 
-def build_commodity_return(close, commodity_codes):
-    """商品篮子: 对各标的归一化后等权平均日收益，自动忽略缺失。"""
+def build_commodity_return(close, commodity_codes, ret_index):
+    """商品篮子: 等权平均日收益，对齐到 ret_index。"""
     rets = close[commodity_codes].pct_change()
-    return rets.mean(axis=1)
+    return rets.mean(axis=1).reindex(ret_index)
 
 
 def build_rotation_signal(close, value_code, growth_code, lookback, thresh, ret_index):
@@ -219,13 +219,14 @@ def build_rotation_signal(close, value_code, growth_code, lookback, thresh, ret_
     signal = signal.ffill().fillna(1)
     signal = signal.reindex(ret_index).ffill().fillna(1)
 
-    ret = close.pct_change()
+    # 日收益必须与 signal 同索引，避免 1592 vs 1593 广播错误
+    daily_ret = close.pct_change().reindex(ret_index)
     stock_ret = pd.Series(
-        np.where(signal.values == 1, ret[value_code], ret[growth_code]),
-        index=ret.index
-    ).reindex(ret_index)
+        np.where(signal.values == 1, daily_ret[value_code].values, daily_ret[growth_code].values),
+        index=ret_index,
+    )
 
-    return signal.reindex(ret_index), stock_ret, ret20_v.reindex(ret_index), ret20_g.reindex(ret_index)
+    return signal, stock_ret, ret20_v.reindex(ret_index), ret20_g.reindex(ret_index)
 
 
 def build_weak_mask(ret20_v, ret20_g, close, value_code, growth_code, ret_index):
@@ -289,14 +290,14 @@ def run_backtest(
     if len(close) < MIN_HISTORY + 10:
         raise ValueError(f'[{label}] 有效样本过短: {len(close)} 天')
 
-    ret_index = close.index[1:]
     ret = close.pct_change().dropna()
+    ret_index = ret.index
 
     _, stock_ret, ret20_v, ret20_g = build_rotation_signal(
         close, VALUE_CODE, GROWTH_CODE, lookback, thresh, ret_index
     )
-    commodity_ret = build_commodity_return(close, commodity_codes).reindex(ret_index)
-    bond_ret = ret[BOND_CODE].reindex(ret_index)
+    commodity_ret = build_commodity_return(close, commodity_codes, ret_index)
+    bond_ret = ret[BOND_CODE]
 
     r = pd.DataFrame({
         'stock': stock_ret,
@@ -448,6 +449,8 @@ for scen_name, budget in BUDGET_SCENARIOS.items():
 
 primary_key = f'{PRIMARY_SCENARIO} | RC'
 if primary_key not in results:
+    if not results:
+        raise RuntimeError('所有回测均失败，请检查上方报错信息')
     primary_key = next(iter(results))
 primary = results[primary_key]
 m = primary['metrics']
@@ -623,7 +626,7 @@ if SHOW_PLOTS:
     ax3.plot(rc_plot['stock'], label='股票 RC')
     ax3.plot(rc_plot['commodity'], label='商品 RC')
     ax3.plot(rc_plot['bond'], label='债券 RC')
-    tb = BUDGET_SCENARIOS[PRIMARY_SCENARIO.split(' | ')[0]]
+    tb = BUDGET_SCENARIOS[ACTIVE_BUDGET]
     ax3.axhline(tb['stock'], color='C0', linestyle='--', alpha=0.5)
     ax3.axhline(tb['commodity'], color='C1', linestyle='--', alpha=0.5)
     ax3.axhline(tb['bond'], color='C2', linestyle='--', alpha=0.5)
