@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-价值/成长轮动 + 多商品 + 国债 — 协方差风险预算(RC) 增强版
+价值/成长轮动 + 多商品 + 国债 — InvVol 风险预算配权
 来源：小红书 @Ellery FIREway 策略改进 + 研究环境增强
 
 在聚宽研究环境 (notebook) 中整段粘贴运行。
@@ -84,10 +84,9 @@ BUDGET_SCENARIOS = {
 ACTIVE_BUDGET = '60:30:10 (增强债)'
 
 LOOKBACK     = 20
-COV_LOOKBACK = 60
 THRESH       = 0.01
 REBAL_FREQ   = 'W-FRI'
-MIN_HISTORY  = max(LOOKBACK, COV_LOOKBACK) + 5
+MIN_HISTORY  = LOOKBACK + 5
 
 WEAK_BOTH_CUT    = True
 WEAK_STOCK_SCALE = 0.40
@@ -189,34 +188,6 @@ def print_data_diagnostics(close_dict, label=''):
     diag = pd.DataFrame(rows, columns=['标的', '首日', '末日', '有效天数'])
     print(diag.to_string(index=False))
     return diag
-
-
-def risk_budget_weights(cov, budgets, max_iter=500, tol=1e-9):
-    budgets = np.asarray(budgets, dtype=float)
-    w = budgets / np.sqrt(np.maximum(np.diag(cov), 1e-16))
-    w = w / w.sum()
-    for _ in range(max_iter):
-        sigma_p = np.sqrt(w @ cov @ w)
-        if sigma_p < 1e-14:
-            break
-        mrc = cov @ w
-        rc = np.maximum(w * mrc / sigma_p, 1e-16)
-        w_new = w * budgets * sigma_p / rc
-        w_new = w_new / w_new.sum()
-        if np.max(np.abs(w_new - w)) < tol:
-            w = w_new
-            break
-        w = w_new
-    return w
-
-
-def calc_risk_contribution(w, cov):
-    w = np.asarray(w, dtype=float)
-    sigma_p = np.sqrt(w @ cov @ w)
-    if sigma_p < 1e-14:
-        return np.zeros_like(w), sigma_p
-    mrc = cov @ w
-    return w * mrc / sigma_p, sigma_p
 
 
 def inverse_vol_weights(budget, vol_row):
@@ -401,12 +372,10 @@ def run_backtest(
     dataset,
     budget,
     lookback=LOOKBACK,
-    cov_lookback=COV_LOOKBACK,
     thresh=THRESH,
     rebal_dates=None,
     one_way_cost_bps=ONE_WAY_COST_BPS,
     max_turnover=MAX_TURNOVER,
-    use_true_rc=True,
     label='',
 ):
     close = dataset['aligned_close'].copy()
@@ -440,23 +409,14 @@ def run_backtest(
         rebal_dates = pd.Index(rebal_dates).intersection(ret_index)
 
     target_w = pd.DataFrame(index=ret_index, columns=assets, dtype=float)
-    rc_check = pd.DataFrame(index=ret_index, columns=assets, dtype=float)
 
     for date in ret_index:
         b_dict = effective_budget(budget, bool(weak_mask.loc[date]))
-        b_vec = np.array([b_dict[a] for a in assets])
-        hist = r.loc[:date].tail(cov_lookback)
+        hist = r.loc[:date].tail(lookback)
         if len(hist) < lookback:
             continue
-        vol_row = hist.tail(lookback).std()
-        if use_true_rc and len(hist) >= cov_lookback:
-            cov = hist.cov().values + np.eye(len(assets)) * 1e-8
-            w = risk_budget_weights(cov, b_vec)
-            rc, _ = calc_risk_contribution(w, cov)
-            rc_check.loc[date] = rc / (rc.sum() + 1e-12)
-        else:
-            w = inverse_vol_weights({a: b_dict[a] for a in assets}, {a: vol_row[a] for a in assets})
-            rc_check.loc[date] = np.nan
+        vol_row = hist.std()
+        w = inverse_vol_weights({a: b_dict[a] for a in assets}, {a: vol_row[a] for a in assets})
         target_w.loc[date] = w
 
     first_valid = target_w.dropna(how='any').index.min()
@@ -511,7 +471,6 @@ def run_backtest(
         port_ret=port_ret,
         nav=metrics['nav'],
         w_hist=w_hist,
-        rc_hist=rc_check.loc[r.index],
         turnover_hist=turnover_hist,
         cost_ret=cost_ret,
         rot_cost_ret=rot_cost_ret,
@@ -525,13 +484,11 @@ def run_backtest(
 def run_all_scenarios(dataset):
     results = {}
     for scen_name, budget in BUDGET_SCENARIOS.items():
-        for use_rc, rc_label in [(True, 'RC'), (False, 'InvVol')]:
-            key = f'{scen_name} | {rc_label}'
-            print(f"  [{dataset['mode']}] 运行: {key} ...")
-            try:
-                results[key] = run_backtest(dataset, budget, use_true_rc=use_rc, label=key)
-            except Exception as e:
-                print(f'    跳过: {e}')
+        print(f"  [{dataset['mode']}] 运行: {scen_name} ...")
+        try:
+            results[scen_name] = run_backtest(dataset, budget, label=scen_name)
+        except Exception as e:
+            print(f'    跳过: {e}')
     return results
 
 
@@ -576,12 +533,12 @@ def compare_modes(mode_store, primary_scenario=PRIMARY_SCENARIO):
     if len(mode_store) < 2:
         return
     print(f"\n{'='*60}")
-    print('多模式对比 (主方案 RC)')
+    print('多模式对比 (主方案 InvVol)')
     print(f"{'='*60}")
     rows = []
     for mode, pack in mode_store.items():
         ds = pack['dataset']
-        pk = f'{primary_scenario} | RC'
+        pk = primary_scenario
         if pk not in pack['results']:
             pk = next(iter(pack['results']))
         m = pack['results'][pk]['metrics']
@@ -618,7 +575,7 @@ for mode in DATA_MODES:
         print(f'[{mode}] 全部失败，跳过')
         continue
 
-    pk = f'{PRIMARY_SCENARIO} | RC'
+    pk = PRIMARY_SCENARIO
     if pk not in results:
         pk = next(iter(results))
     primary = print_mode_summary(ds, results, pk)
@@ -640,7 +597,7 @@ if RUN_GRID and PRIMARY_DATA_MODE in mode_store:
     pack = mode_store[PRIMARY_DATA_MODE]
     ds = pack['dataset']
     print(f"\n{'='*60}")
-    print(f'参数网格 [{PRIMARY_DATA_MODE}] RC + {ACTIVE_BUDGET}...')
+    print(f'参数网格 [{PRIMARY_DATA_MODE}] InvVol + {ACTIVE_BUDGET}...')
     print(f"{'='*60}")
     grid_rows = []
     base_budget = BUDGET_SCENARIOS[ACTIVE_BUDGET]
@@ -652,7 +609,7 @@ if RUN_GRID and PRIMARY_DATA_MODE in mode_store:
                     gres = run_backtest(
                         ds, base_budget, lookback=lb, thresh=th,
                         rebal_dates=get_rebal_dates_step(idx, rb),
-                        use_true_rc=True, label='grid',
+                        label='grid',
                     )
                     gm = gres['metrics']
                     grid_rows.append({'LOOKBACK': lb, 'THRESH': th, 'REBAL': rb,
